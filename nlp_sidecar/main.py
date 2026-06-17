@@ -1,54 +1,162 @@
-import spacy
-import numpy as np
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+"""
+Russian NLP sidecar.
+
+Stack:
+  razdel      — Russian tokenizer
+  pymorphy3   — morphological analysis + lemmatization
+  natasha     — NER (Money/Date/Person/Location/Org) + dependency parsing
+  GLiNER      — zero-shot domain NER driven by config labels
+  sentence-transformers (multilingual) — implicit intent detection
+"""
+
+import os
+import re
+import json
+from pathlib import Path
 from typing import Optional
+
+import numpy as np
+import pymorphy3
 import uvicorn
+from fastapi import FastAPI, HTTPException
+from gliner import GLiNER
+from natasha import (
+    Doc,
+    MorphVocab,
+    NewsEmbedding,
+    NewsMorphTagger,
+    NewsDependencyParser,
+    NewsNERTagger,
+    Segmenter,
+)
+from pydantic import BaseModel
+from razdel import tokenize as razdel_tokenize
+from sentence_transformers import SentenceTransformer
 
-nlp = spacy.load("en_core_web_sm")
 
-app = FastAPI(title="NLP Sidecar")
+# ── startup: load all models once ─────────────────────────────────────────────
+
+print("Loading models…")
+
+# natasha pipeline
+_emb  = NewsEmbedding()
+_segm = Segmenter()
+_morph_tagger = NewsMorphTagger(_emb)
+_dep_parser   = NewsDependencyParser(_emb)
+_ner_tagger   = NewsNERTagger(_emb)
+_morph_vocab  = MorphVocab()
+
+# pymorphy3 — morphological analyser (handles every inflected form)
+_morphy = pymorphy3.MorphAnalyzer()
+
+# GLiNER — zero-shot NER with labels coming from config at runtime
+_gliner = GLiNER.from_pretrained("urchade/gliner_multi-v2.1")
+
+# Sentence-transformers — multilingual, good Russian support
+_st_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+
+print("Models ready.")
+
+app = FastAPI(title="Russian NLP Sidecar")
 
 
-# ── request / response models ────────────────────────────────────────────────
+# ── config: load GLiNER domain labels from filter configs ─────────────────────
+
+def _load_gliner_labels(config_dir: str = "/config/filters") -> list[str]:
+    """
+    Read all YAML/JSON filter configs and collect gliner_labels fields.
+    Falls back to a sensible default set if configs not mounted.
+    """
+    labels: list[str] = []
+    p = Path(config_dir)
+    if p.exists():
+        import yaml  # optional dep only needed here
+        for f in p.glob("*.yaml"):
+            data = yaml.safe_load(f.read_text())
+            labels.extend(data.get("gliner_labels", []))
+    if not labels:
+        labels = [
+            "цена", "максимальная цена", "минимальная цена",
+            "цвет", "размер", "бренд", "материал", "состояние",
+            "категория", "вес", "объём", "гарантия",
+        ]
+    return list(dict.fromkeys(labels))  # deduplicate, preserve order
+
+_GLINER_LABELS = _load_gliner_labels()
+
+
+# ── intent anchors (Russian seed words) ───────────────────────────────────────
+
+_INTENT_ANCHORS_RU = [
+    ("PRICE_LOW",      ["дешёвый", "недорогой", "бюджетный", "экономичный", "доступный", "выгодный"]),
+    ("PRICE_HIGH",     ["дорогой", "премиальный", "люксовый", "элитный", "эксклюзивный"]),
+    ("SORT_DATE_DESC", ["новый", "новинка", "свежий", "актуальный", "последний"]),
+    ("SORT_POPULAR",   ["популярный", "трендовый", "хит", "бестселлер", "топ"]),
+    ("CONDITION_NEW",  ["новый", "новьё", "запечатанный", "нераспакованный"]),
+    ("CONDITION_USED", ["б/у", "бу", "подержанный", "секонд", "восстановленный"]),
+    ("GEO_NEARBY",     ["рядом", "поблизости", "недалеко", "близко", "рядышком"]),
+    ("FREE_DELIVERY",  ["бесплатная доставка", "с доставкой", "доставка бесплатно"]),
+    ("IN_STOCK",       ["в наличии", "есть в наличии", "в наличие"]),
+]
+
+# precompute normalised anchor vectors
+_anchor_vecs: list[tuple[str, np.ndarray, float]] = []
+for _name, _seeds, *_rest in _INTENT_ANCHORS_RU:
+    _threshold = _rest[0] if _rest else 0.60
+    _vecs = _st_model.encode(_seeds, normalize_embeddings=True)
+    _avg  = _vecs.mean(axis=0)
+    _avg  = _avg / (np.linalg.norm(_avg) + 1e-9)
+    _anchor_vecs.append((_name, _avg, _threshold))
+
+
+# ── pydantic models ────────────────────────────────────────────────────────────
 
 class AnalyzeRequest(BaseModel):
     text: str
-    include_embeddings: bool = False  # sentence-level embedding (slow)
+    include_embeddings: bool = False
+    gliner_labels: Optional[list[str]] = None  # override config labels at request time
+
+
+class MorphInfo(BaseModel):
+    lemma: str
+    pos: str                    # pymorphy3 POS: NOUN, ADJF, VERB, NUMR …
+    case: Optional[str] = None  # Nom Gent Datv Accs Ablt Loct
+    number: Optional[str] = None
+    gender: Optional[str] = None
+    grammemes: list[str] = []
 
 
 class Token(BaseModel):
-    i: int           # token index in doc
+    i: int
     text: str
     lemma: str
-    pos: str         # NOUN, VERB, ADJ, NUM, PUNCT …
-    tag: str         # fine-grained POS
-    dep: str         # dependency relation to head
-    head_i: int      # index of syntactic head token
-    is_stop: bool
-    is_punct: bool
-    start: int       # char offset start
-    end: int         # char offset end
+    pos: str         # pymorphy3 POS
+    dep: str         # natasha dependency relation
+    head_i: int
+    start: int
+    end: int
+    morph: MorphInfo
 
 
 class Entity(BaseModel):
     text: str
-    label: str       # spaCy built-in: MONEY, DATE, CARDINAL, ORG, GPE …
-                     # + custom: PRICE_MAX, PRICE_MIN, COLOR, BRAND …
-    start: int       # char offset
+    lemma: str       # lemmatised form of entity text
+    label: str       # MONEY DATE PER LOC ORG (natasha) or domain label (GLiNER)
+    source: str      # "natasha" | "gliner"
+    start: int
     end: int
-    token_start: int # token index start
-    token_end: int   # token index end (exclusive)
     confidence: float
 
 
 class NegationScope(BaseModel):
-    neg_token_i: int        # index of "not/no/never/-" token
-    scope_token_indices: list[int]  # tokens under negation scope
+    neg_token_i: int
+    neg_text: str
+    scope_token_indices: list[int]
+    scope_lemmas: list[str]
 
 
 class IntentSignal(BaseModel):
-    name: str        # PRICE_LOW, PRICE_HIGH, SORT_DATE_DESC, GEO_NEARBY …
+    name: str
     confidence: float
     source_tokens: list[int]
 
@@ -59,185 +167,220 @@ class AnalyzeResponse(BaseModel):
     entities: list[Entity]
     negation_scopes: list[NegationScope]
     intent_signals: list[IntentSignal]
-    embedding: Optional[list[float]] = None  # sentence vector if requested
+    morphology_map: dict[str, MorphInfo]  # original_form → morph info
+    embedding: Optional[list[float]] = None
 
 
-# ── intent anchors ───────────────────────────────────────────────────────────
-# each entry: (intent_name, seed_words, threshold)
-INTENT_ANCHORS = [
-    ("PRICE_LOW",       ["affordable", "cheap", "budget", "inexpensive", "low-cost", "economical"], 0.55),
-    ("PRICE_HIGH",      ["premium", "luxury", "expensive", "high-end", "exclusive", "professional"], 0.55),
-    ("SORT_DATE_DESC",  ["latest", "newest", "recent", "new", "fresh"], 0.60),
-    ("SORT_POPULAR",    ["popular", "trending", "bestseller", "top-rated", "best"], 0.60),
-    ("GEO_NEARBY",      ["nearby", "local", "near me", "close"], 0.65),
-    ("CONDITION_NEW",   ["brand-new", "new", "sealed", "unopened"], 0.70),
-    ("CONDITION_USED",  ["used", "second-hand", "pre-owned", "refurbished"], 0.65),
-]
+# ── helpers ────────────────────────────────────────────────────────────────────
 
-# precompute average vectors for each anchor group
-_anchor_vectors: list[tuple[str, np.ndarray, float]] = []
-
-def _build_anchors() -> None:
-    for name, seeds, threshold in INTENT_ANCHORS:
-        vecs = [nlp(w).vector for w in seeds if nlp(w).has_vector]
-        if vecs:
-            avg = np.mean(vecs, axis=0)
-            norm = np.linalg.norm(avg)
-            if norm > 0:
-                avg = avg / norm
-            _anchor_vectors.append((name, avg, threshold))
-
-_build_anchors()
+def _pymorphy_info(word: str) -> MorphInfo:
+    parsed = _morphy.parse(word)
+    if not parsed:
+        return MorphInfo(lemma=word.lower(), pos="UNKN", grammemes=[])
+    best = parsed[0]
+    tag  = best.tag
+    grammemes = [str(g) for g in tag.grammemes]
+    return MorphInfo(
+        lemma=best.normal_form,
+        pos=str(tag.POS) if tag.POS else "UNKN",
+        case=str(tag.case) if tag.case else None,
+        number=str(tag.number) if tag.number else None,
+        gender=str(tag.gender) if tag.gender else None,
+        grammemes=grammemes,
+    )
 
 
-def _cosine(a: np.ndarray, b: np.ndarray) -> float:
-    na, nb = np.linalg.norm(a), np.linalg.norm(b)
-    if na == 0 or nb == 0:
-        return 0.0
-    return float(np.dot(a, b) / (na * nb))
+def _lemmatise_span(text: str) -> str:
+    """Lemmatise each token of a multi-word span."""
+    return " ".join(_morphy.parse(w)[0].normal_form for w in text.split())
 
 
-# ── negation scope resolver ──────────────────────────────────────────────────
-
-def _resolve_negation_scopes(doc: spacy.tokens.Doc) -> list[NegationScope]:
+def _resolve_negations(doc: Doc, tokens: list[Token]) -> list[NegationScope]:
     """
-    Walk the dependency tree to find what each negation token governs.
-    neg → head → collect head + all its right children (the scope).
-    Also handles: "-word" prefix patterns.
+    Walk natasha dependency tree.
+    Russian negation markers: не, нет, ни, без, кроме, нельзя.
     """
+    NEG_LEMMAS = {"не", "нет", "ни", "без", "кроме", "нельзя", "никакой"}
+
+    # build index: token_id → Token
+    tok_by_id = {t.i: t for t in tokens}
+
+    # build children map from dep tree
+    children: dict[int, list[int]] = {t.i: [] for t in tokens}
+    for t in tokens:
+        if t.i != t.head_i:
+            children[t.head_i].append(t.i)
+
+    def subtree(i: int) -> list[int]:
+        result = [i]
+        for c in children.get(i, []):
+            result.extend(subtree(c))
+        return result
+
     scopes: list[NegationScope] = []
-
-    for token in doc:
-        # syntactic negation: dep == "neg"
-        if token.dep_ == "neg":
-            head = token.head
-            scope_indices = [head.i] + [t.i for t in head.subtree if t.i != token.i]
+    for t in tokens:
+        morph = _pymorphy_info(t.text)
+        if morph.lemma in NEG_LEMMAS:
+            head_i = t.head_i
+            scope_indices = [i for i in subtree(head_i) if i != t.i]
+            scope_lemmas  = [tok_by_id[i].lemma for i in scope_indices if i in tok_by_id]
             scopes.append(NegationScope(
-                neg_token_i=token.i,
+                neg_token_i=t.i,
+                neg_text=t.text,
                 scope_token_indices=sorted(scope_indices),
+                scope_lemmas=scope_lemmas,
             ))
-
-        # prefix negation: token text starts with "-" and is followed by a word
-        if token.text.startswith("-") and len(token.text) > 1:
-            scopes.append(NegationScope(
-                neg_token_i=token.i,
-                scope_token_indices=[token.i],
-            ))
-
     return scopes
 
 
-# ── intent detection ─────────────────────────────────────────────────────────
-
-def _detect_intents(doc: spacy.tokens.Doc) -> list[IntentSignal]:
+def _detect_intents(text: str, tokens: list[Token]) -> list[IntentSignal]:
     signals: list[IntentSignal] = []
 
-    for token in doc:
-        if not token.has_vector or token.is_stop or token.is_punct:
+    for t in tokens:
+        if t.pos in ("PUNCT", "CONJ"):
             continue
-
-        tv = token.vector / (np.linalg.norm(token.vector) + 1e-9)
-        for name, anchor_vec, threshold in _anchor_vectors:
-            score = _cosine(tv, anchor_vec)
+        vec = _st_model.encode([t.text], normalize_embeddings=True)[0]
+        for name, anchor, threshold in _anchor_vecs:
+            score = float(np.dot(vec, anchor))
             if score >= threshold:
                 signals.append(IntentSignal(
                     name=name,
                     confidence=round(score, 4),
-                    source_tokens=[token.i],
+                    source_tokens=[t.i],
                 ))
 
-    # deduplicate: keep highest confidence per intent name
+    # also run multi-word intent phrases (e.g. "в наличии", "бесплатная доставка")
+    phrase_vec = _st_model.encode([text], normalize_embeddings=True)[0]
+    for name, anchor, threshold in _anchor_vecs:
+        score = float(np.dot(phrase_vec, anchor))
+        if score >= threshold:
+            signals.append(IntentSignal(name=name, confidence=round(score, 4), source_tokens=[]))
+
+    # deduplicate — keep highest confidence per intent
     best: dict[str, IntentSignal] = {}
     for s in signals:
         if s.name not in best or s.confidence > best[s.name].confidence:
             best[s.name] = s
-
     return sorted(best.values(), key=lambda x: -x.confidence)
 
 
-# ── entity confidence heuristic ──────────────────────────────────────────────
-# spaCy NER doesn't expose per-entity confidence in the default pipeline.
-# We use a simple heuristic: entities with longer spans and known labels
-# get higher base confidence.
-_LABEL_BASE_CONFIDENCE = {
-    "MONEY":    0.92,
-    "DATE":     0.88,
-    "CARDINAL": 0.75,
-    "ORG":      0.80,
-    "GPE":      0.82,
-    "PERSON":   0.78,
-    "PRODUCT":  0.70,
-    "QUANTITY": 0.80,
-    "PERCENT":  0.85,
-    "TIME":     0.85,
-}
-
-def _entity_confidence(ent: spacy.tokens.Span) -> float:
-    base = _LABEL_BASE_CONFIDENCE.get(ent.label_, 0.60)
-    length_bonus = min(0.05 * (len(ent) - 1), 0.10)
-    return round(min(base + length_bonus, 0.99), 4)
-
-
-# ── main endpoint ─────────────────────────────────────────────────────────────
+# ── main endpoint ──────────────────────────────────────────────────────────────
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
     if not req.text or not req.text.strip():
         raise HTTPException(status_code=400, detail="text must not be empty")
 
-    doc = nlp(req.text)
+    text = req.text.strip()
 
-    tokens = [
-        Token(
-            i=t.i,
-            text=t.text,
-            lemma=t.lemma_,
-            pos=t.pos_,
-            tag=t.tag_,
-            dep=t.dep_,
-            head_i=t.head.i,
-            is_stop=t.is_stop,
-            is_punct=t.is_punct,
-            start=t.idx,
-            end=t.idx + len(t.text),
+    # ── 1. tokenise with razdel ─────────────────────────────────────────
+    raw_tokens = list(razdel_tokenize(text))
+
+    # ── 2. morphological analysis with pymorphy3 ────────────────────────
+    tokens: list[Token] = []
+    morph_map: dict[str, MorphInfo] = {}
+    for i, rt in enumerate(raw_tokens):
+        m = _pymorphy_info(rt.text)
+        morph_map[rt.text] = m
+        tokens.append(Token(
+            i=i,
+            text=rt.text,
+            lemma=m.lemma,
+            pos=m.pos,
+            dep="",      # filled below by natasha
+            head_i=i,    # filled below
+            start=rt.start,
+            end=rt.stop,
+            morph=m,
+        ))
+
+    # ── 3. natasha: NER + dependency parsing ────────────────────────────
+    doc = Doc(text)
+    doc.segment(_segm)
+    doc.tag_morph(_morph_tagger)
+    doc.parse_syntax(_dep_parser)
+    doc.tag_ner(_ner_tagger)
+
+    for span in doc.spans:
+        span.normalize(_morph_vocab)
+
+    # apply natasha dep relations back to our token list
+    # natasha tokens align by char offsets
+    char_to_tok: dict[int, int] = {t.start: t.i for t in tokens}
+    for nt in doc.tokens:
+        t_i = char_to_tok.get(nt.start)
+        if t_i is not None:
+            tokens[t_i].dep    = nt.rel or ""
+            head_start = nt.head_start if hasattr(nt, "head_start") else nt.start
+            tokens[t_i].head_i = char_to_tok.get(head_start, t_i)
+
+    # collect natasha entities
+    entities: list[Entity] = []
+    for span in doc.spans:
+        entities.append(Entity(
+            text=span.text,
+            lemma=span.normal or _lemmatise_span(span.text),
+            label=span.type,          # PER LOC ORG MONEY DATE
+            source="natasha",
+            start=span.start,
+            end=span.stop,
+            confidence=0.88,          # natasha doesn't expose per-span score
+        ))
+
+    # ── 4. GLiNER: domain entity extraction ─────────────────────────────
+    labels = req.gliner_labels or _GLINER_LABELS
+    gliner_entities = _gliner.predict_entities(text, labels, threshold=0.50)
+    for ge in gliner_entities:
+        # skip if already covered by natasha span
+        overlap = any(
+            e.start <= ge["start"] < e.end or ge["start"] <= e.start < ge["end"]
+            for e in entities
         )
-        for t in doc
-    ]
+        if not overlap:
+            entities.append(Entity(
+                text=ge["text"],
+                lemma=_lemmatise_span(ge["text"]),
+                label=ge["label"].upper().replace(" ", "_"),
+                source="gliner",
+                start=ge["start"],
+                end=ge["end"],
+                confidence=round(ge["score"], 4),
+            ))
 
-    entities = [
-        Entity(
-            text=ent.text,
-            label=ent.label_,
-            start=ent.start_char,
-            end=ent.end_char,
-            token_start=ent.start,
-            token_end=ent.end,
-            confidence=_entity_confidence(ent),
-        )
-        for ent in doc.ents
-    ]
+    # ── 5. negation scopes ───────────────────────────────────────────────
+    negation_scopes = _resolve_negations(doc, tokens)
 
-    negation_scopes = _resolve_negation_scopes(doc)
-    intent_signals  = _detect_intents(doc)
+    # ── 6. intent signals ────────────────────────────────────────────────
+    intent_signals = _detect_intents(text, tokens)
 
+    # ── 7. sentence embedding (optional) ────────────────────────────────
     embedding: Optional[list[float]] = None
     if req.include_embeddings:
-        embedding = doc.vector.tolist()
+        embedding = _st_model.encode([text], normalize_embeddings=True)[0].tolist()
 
     return AnalyzeResponse(
-        text=req.text,
+        text=text,
         tokens=tokens,
-        entities=entities,
+        entities=sorted(entities, key=lambda e: e.start),
         negation_scopes=negation_scopes,
         intent_signals=intent_signals,
+        morphology_map=morph_map,
         embedding=embedding,
     )
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "model": nlp.meta["name"]}
+    return {"status": "ok", "gliner_labels": _GLINER_LABELS}
+
+
+@app.post("/reload-labels")
+def reload_labels() -> dict:
+    """Hot-reload GLiNER labels from config without restarting."""
+    global _GLINER_LABELS
+    _GLINER_LABELS = _load_gliner_labels()
+    return {"status": "ok", "labels": _GLINER_LABELS}
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=8001, workers=1)

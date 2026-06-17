@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// Client calls the Python NLP sidecar.
+// Client calls the Russian NLP sidecar.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
@@ -30,10 +30,12 @@ func NewClient(addr string, timeout time.Duration) *Client {
 }
 
 // Analyze sends the raw query to the sidecar and returns full NLP annotation.
-func (c *Client) Analyze(ctx context.Context, text string, withEmbedding bool) (*AnalyzeResponse, error) {
+// Pass glinerLabels to override the sidecar's config-loaded label set for this call.
+func (c *Client) Analyze(ctx context.Context, text string, withEmbedding bool, glinerLabels []string) (*AnalyzeResponse, error) {
 	body, err := json.Marshal(AnalyzeRequest{
 		Text:              text,
 		IncludeEmbeddings: withEmbedding,
+		GlinerLabels:      glinerLabels,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("nlp: marshal request: %w", err)
@@ -68,7 +70,25 @@ func (c *Client) Analyze(ctx context.Context, text string, withEmbedding bool) (
 	return &result, nil
 }
 
-// HealthCheck returns true if the sidecar is reachable and healthy.
+// ReloadLabels tells the sidecar to re-read filter configs without restarting.
+func (c *Client) ReloadLabels(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/reload-labels", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("nlp: reload-labels: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("nlp: reload-labels %d: %s", resp.StatusCode, b)
+	}
+	return nil
+}
+
+// HealthCheck returns nil if the sidecar is reachable and healthy.
 func (c *Client) HealthCheck(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/health", nil)
 	if err != nil {
@@ -83,4 +103,36 @@ func (c *Client) HealthCheck(ctx context.Context) error {
 		return fmt.Errorf("nlp sidecar unhealthy: status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// EntitiesByLabel returns all entities matching the given label (case-insensitive).
+func (r *AnalyzeResponse) EntitiesByLabel(label string) []Entity {
+	var out []Entity
+	for _, e := range r.Entities {
+		if e.Label == label {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// HasIntent returns true if the response contains an intent signal with confidence >= min.
+func (r *AnalyzeResponse) HasIntent(name string, minConfidence float64) bool {
+	for _, s := range r.IntentSignals {
+		if s.Name == name && s.Confidence >= minConfidence {
+			return true
+		}
+	}
+	return false
+}
+
+// NegatedLemmas returns the set of lemmas that are under any negation scope.
+func (r *AnalyzeResponse) NegatedLemmas() map[string]bool {
+	out := make(map[string]bool)
+	for _, ns := range r.NegationScopes {
+		for _, l := range ns.ScopeLemmas {
+			out[l] = true
+		}
+	}
+	return out
 }
