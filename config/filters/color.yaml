@@ -1,0 +1,23 @@
+name: color
+field: color
+type: categorical
+min_confidence: 0.65
+hard_threshold: 0.75
+low_confidence_action: drop
+
+gliner_labels: ["цвет", "color"]
+
+value_mapping:
+  "красный":   "red"
+  "синий":     "blue"
+  "зелёный":   "green"
+  "чёрный":    "black"
+  "белый":     "white"
+  "серый":     "gray"
+  "жёлтый":   "yellow"
+  "розовый":   "pink"
+  "фиолетовый": "purple"
+  "оранжевый": "orange"
+  "коричневый": "brown"
+  "золотой":   "gold"
+  "серебристый": "silver"

@@ -1,0 +1,35 @@
+name: price
+field: price
+type: money
+min_confidence: 0.70
+hard_threshold: 0.80
+low_confidence_action: boost
+
+natasha_labels: ["MONEY"]
+gliner_labels: ["цена", "максимальная цена", "минимальная цена", "стоимость"]
+
+direction_words:
+  lte: ["до", "не более", "максимум", "не дороже", "дешевле", "под", "max", "maximum"]
+  gte: ["от", "не менее", "минимум", "не дешевле", "дороже", "от", "min", "minimum"]
+  lt:  ["меньше чем", "ниже чем", "дешевле чем"]
+  gt:  ["больше чем", "выше чем", "дороже чем", "свыше"]
+
+currency_aliases:
+  "руб":     "RUB"
+  "рублей":  "RUB"
+  "рублёй":  "RUB"
+  "₽":       "RUB"
+  "$":       "USD"
+  "usd":     "USD"
+  "доллар":  "USD"
+  "€":       "EUR"
+  "евро":    "EUR"
+  "тыс":     "MULTIPLIER_1000"
+
+intent_mapping:
+  PRICE_LOW:
+    action: boost
+    boost_field: price_tier_budget
+  PRICE_HIGH:
+    action: boost
+    boost_field: price_tier_premium

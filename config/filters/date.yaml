@@ -1,0 +1,19 @@
+name: date
+field: created_at
+type: date
+min_confidence: 0.75
+hard_threshold: 0.85
+low_confidence_action: boost
+
+natasha_labels: ["DATE"]
+gliner_labels: ["дата", "период", "год выпуска"]
+
+direction_words:
+  gte: ["с", "от", "после", "начиная с", "newer than", "since"]
+  lte: ["до", "по", "раньше", "до даты", "before"]
+
+intent_mapping:
+  SORT_DATE_DESC:
+    action: sort
+    sort_field: created_at
+    sort_desc: true

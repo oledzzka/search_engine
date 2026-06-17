@@ -1,0 +1,26 @@
+name: availability
+field: ~
+type: boolean
+min_confidence: 0.70
+hard_threshold: 0.70
+low_confidence_action: drop
+
+gliner_labels: ["наличие", "доступность", "доставка"]
+
+bool_phrases:
+  "в наличии":             { field: available,      value: true  }
+  "в наличие":             { field: available,      value: true  }
+  "есть в наличии":        { field: available,      value: true  }
+  "нет в наличии":         { field: available,      value: false }
+  "под заказ":             { field: available,      value: false }
+  "бесплатная доставка":   { field: free_shipping,  value: true  }
+  "с доставкой":           { field: has_shipping,   value: true  }
+  "самовывоз":             { field: pickup,         value: true  }
+  "на распродаже":         { field: on_sale,        value: true  }
+  "со скидкой":            { field: on_sale,        value: true  }
+
+intent_mapping:
+  IN_STOCK:
+    action: filter
+  FREE_DELIVERY:
+    action: filter
